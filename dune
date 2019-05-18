@@ -1,0 +1,29 @@
+;(env
+; (ci_build (flags (:standard (:include dune_flags.sexp) -warn-error +A-d)))
+; (_ (flags (:include dune_flags.sexp))))
+(env (_ (flags (-thread -strict-formats -strict-sequence -short-paths -safe-string -w +a-4-40-42-44-48))))
+
+; Git version
+
+(executable
+ (name gen_version)
+ (libraries mybuild)
+ (modules gen_version))
+
+(rule
+ (targets version.ml)
+ (deps (universe))
+ (action (run ./gen_version.bc %{targets})))
+
+(library
+ (name version)
+ (wrapped false)
+ (flags (:standard -opaque))
+ (modules version))
+
+(executable
+ (name ssb)
+ ;(public_name ssb)
+ (modules :standard \ gen_version version)
+ (libraries extlib sodium lwt.unix atd lwt_ppx sha version)
+ (preprocess (pps lwt_ppx)))
