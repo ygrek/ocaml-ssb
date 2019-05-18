@@ -8,8 +8,92 @@ let public = Sign.Bytes.to_public_key @@ Bytes.of_string "\135P\027\137\220\239\
 
 let main_network = Auth.Bytes.to_key @@ Bytes.of_string "\xd4\xa1\xcb\x88\xa6\x6f\x02\xf8\xdb\x63\x5c\xe2\x64\x41\xcc\x5d\xac\x1b\x08\x42\x0c\xea\xac\x23\x08\x39\xb7\x55\x84\x5a\x9f\xfb"
 
-let concat_s l = String.concat "" (List.map Bytes.to_string l)
+let concat_s l = String.concat "" (List.map Bytes.unsafe_to_string l)
 let concat l = Bytes.unsafe_of_string @@ concat_s l
+
+let sha256 x = Bytes.unsafe_of_string @@ Sha256.(to_bin @@ string @@ Bytes.to_string x)
+
+module BoxStream = struct
+
+  exception Goodbye
+
+  type 'a stream = { ch : 'a Lwt_io.channel; key : Secret_box.secret_key; mutable nonce : Secret_box.nonce; }
+  type t = { mutable input : Lwt_io.input stream option; mutable output : Lwt_io.output stream option; }
+
+  let create (ic,oc) ~server_pk ~server_epk ~pk ~epk key =
+    let make_key pk = Secret_box.Bytes.to_key @@ sha256 @@ concat [sha256 @@ sha256 key; Sign.Bytes.of_public_key pk] in
+    let make_nonce epk = Secret_box.Bytes.to_nonce @@ Bytes.sub Auth.Bytes.(of_auth @@ auth main_network (Box.Bytes.of_public_key epk)) 0 24 in
+    {
+      input = Some { ch = ic; key = make_key pk; nonce = make_nonce epk };
+      output = Some { ch = oc; key = make_key server_pk; nonce = make_nonce server_epk }
+    }
+
+  let send s body =
+    let size = String.length body in
+    assert (size > 0);
+    assert (size <= 4096);
+    let nonce1 = s.nonce in
+    let nonce2 = Secret_box.increment_nonce nonce1 in
+    s.nonce <- Secret_box.increment_nonce nonce2;
+    let box2 = Secret_box.Bytes.secret_box s.key (Bytes.unsafe_of_string body) nonce2 in
+    assert (Bytes.length box2 = 16 + size);
+    let header = Bytes.create 18 in
+    EndianBytes.BigEndian.set_int16 header 0 size;
+    Bytes.blit box2 0 header 2 16;
+    let box1 = Secret_box.Bytes.secret_box s.key header nonce1 in
+    assert (Bytes.length box1 = 16 + 18);
+    Lwt_io.write s.ch (concat_s [box1; Bytes.sub box2 16 size])
+
+  let send t s =
+    match t.output with
+    | None -> fail "BoxStream.send: output already closed"
+    | Some stream ->
+    let rec loop pos =
+      if pos < String.length s then
+        let len = min 4096 (String.length s - pos) in
+        let%lwt () = send stream (String.sub s pos len) in
+        loop (pos+len)
+      else
+        Lwt_io.flush stream.ch
+    in
+    loop 0
+
+  let zero_header = Bytes.make 18 '\x00'
+
+  let goodbye t =
+    match t.output with
+    | None -> fail "BoxStream.goodbye: already said goodbye"
+    | Some s ->
+      t.output <- None;
+      Lwt_io.write s.ch (Bytes.unsafe_to_string @@ Secret_box.Bytes.secret_box s.key zero_header s.nonce)
+
+  let receive t =
+    match t.input with
+    | None -> fail "BoxStream.receive: input already closed"
+    | Some s ->
+      let header_box = Bytes.create 34 in
+      let%lwt () = Lwt_io.read_into_exactly s.ch header_box 0 34 in
+      let header = Secret_box.Bytes.secret_box_open s.key header_box s.nonce in
+      assert (Bytes.length header = 18);
+      match Bytes.equal header zero_header with
+      | true ->
+        t.input <- None;
+        Lwt.fail Goodbye
+      | false ->
+        s.nonce <- Secret_box.increment_nonce s.nonce;
+        let body_size = EndianBytes.BigEndian.get_uint16 header 0 in
+        assert (body_size > 0);
+        assert (body_size <= 4096);
+        let body_box = Bytes.create (16 + body_size) in
+        Bytes.blit header 2 body_box 0 16;
+        let%lwt () = Lwt_io.read_into_exactly s.ch body_box 16 body_size in
+        let body = Secret_box.Bytes.secret_box_open s.key body_box s.nonce in
+        s.nonce <- Secret_box.increment_nonce s.nonce;
+        Lwt.return @@ Bytes.unsafe_to_string body
+
+end
+
+module Handshake = struct
 
 (*
 assert(length(msg2) == 64)
@@ -53,8 +137,6 @@ let shared_secrets ~sk ~esk ~server_pk ~server_epk =
   Bytes.of_group_elt @@ mult esk server_epk,
   Bytes.of_group_elt @@ mult esk (Bytes.to_group_elt @@ Box.Bytes.of_public_key @@ Sign.box_public_key server_pk),
   Bytes.of_group_elt @@ mult (Bytes.to_integer @@ Box.Bytes.of_secret_key @@ Sign.box_secret_key sk) server_epk
-
-let sha256 x = Bytes.unsafe_of_string @@ Sha256.(to_bin @@ string @@ Bytes.to_string x)
 
 (*
 detached_signature_A = nacl_sign_detached(
@@ -134,7 +216,7 @@ let client_verify ~shared_secrets:(ss_ab,ss_aB,ss_Ab) ~detached_sig_A ~pk ~serve
     sha256 ss_ab;
   ] in
   Sign.Bytes.verify server_pk (Sign.Bytes.to_signature detached_sig_B) verify;
-  Secret_box.Bytes.to_key key
+  key
 
 (*
 concat(
@@ -161,12 +243,33 @@ let client_handshake ~server_pk (ic,oc) =
   let%lwt () = Lwt_io.write oc (Bytes.unsafe_to_string client_auth) in
   let server_accept = Bytes.create 80 in
   let%lwt () = Lwt_io.read_into_exactly ic server_accept 0 80 in
-  Lwt.return @@ client_verify ~shared_secrets ~detached_sig_A ~pk:public ~server_pk server_accept
+  let shared_key = client_verify ~shared_secrets ~detached_sig_A ~pk:public ~server_pk server_accept in
+  Lwt.return @@ BoxStream.create (ic,oc) ~server_pk ~server_epk ~pk:public ~epk shared_key
+
+end (* Handshake *)
+
+
+module RPC = struct
+
+end
 
 let execute_client ~server_pk c =
-  let _shared_key = client_handshake ~server_pk c in
+  let%lwt box_stream = Handshake.client_handshake ~server_pk c in
   printfn "verified";
-  Lwt.return_unit
+  let%lwt msg = BoxStream.receive box_stream in
+  printfn "received: %S" msg;
+  assert (String.length msg = 9);
+  let size = Unsigned.UInt32.(to_int @@ of_int32 @@ EndianString.BigEndian.get_int32 msg 1) in
+  printfn "size %d" size;
+  let%lwt msg = BoxStream.receive box_stream in
+  printfn "msg: %S" msg;
+  let%lwt () = BoxStream.send box_stream "\x0e\x00\x00\x00\x04\xff\xff\xff\xfftrue" in
+  printfn "answered";
+  while%lwt true do
+    let%lwt msg = BoxStream.receive box_stream in
+    printfn "msg: %S" msg;
+    Lwt.return_unit
+  done
 
 let test () =
   (* net:192.168.1.40:8008~shs:nRlzaYFcYB6X2QevJ3MZrgJnhozOesb4hrd7ENK4PS4= *)

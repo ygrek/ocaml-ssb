@@ -1,7 +1,7 @@
 ;(env
 ; (ci_build (flags (:standard (:include dune_flags.sexp) -warn-error +A-d)))
 ; (_ (flags (:include dune_flags.sexp))))
-(env (_ (flags (-thread -strict-formats -strict-sequence -short-paths -safe-string -w +a-4-40-42-44-48))))
+(env (_ (flags (-g -strict-formats -strict-sequence -short-paths -safe-string -w +a-4-40-42-44-48))))
 
 ; Git version
 
@@ -25,5 +25,5 @@
  (name ssb)
  ;(public_name ssb)
  (modules :standard \ gen_version version)
- (libraries extlib sodium lwt.unix atd lwt_ppx sha version)
+ (libraries extlib sodium lwt.unix atd lwt_ppx sha ocplib-endian integers version)
  (preprocess (pps lwt_ppx)))
