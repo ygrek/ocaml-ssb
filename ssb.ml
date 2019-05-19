@@ -13,6 +13,14 @@ let concat l = Bytes.unsafe_of_string @@ concat_s l
 
 let sha256 x = Bytes.unsafe_of_string @@ Sha256.(to_bin @@ string @@ Bytes.to_string x)
 
+let lwt_io_read ch n =
+  assert (n > 0);
+  let b = Bytes.create n in
+  let%lwt () = Lwt_io.read_into_exactly ch b 0 n in
+  Lwt.return b
+
+let lwt_io_read_s ch n = Lwt.map Bytes.unsafe_to_string (lwt_io_read ch n)
+
 module BoxStream = struct
 
   exception Goodbye
@@ -65,14 +73,14 @@ module BoxStream = struct
     | None -> fail "BoxStream.goodbye: already said goodbye"
     | Some s ->
       t.output <- None;
-      Lwt_io.write s.ch (Bytes.unsafe_to_string @@ Secret_box.Bytes.secret_box s.key zero_header s.nonce)
+      let%lwt () = Lwt_io.write s.ch (Bytes.unsafe_to_string @@ Secret_box.Bytes.secret_box s.key zero_header s.nonce) in
+      Lwt_io.flush s.ch
 
   let receive t =
     match t.input with
     | None -> fail "BoxStream.receive: input already closed"
     | Some s ->
-      let header_box = Bytes.create 34 in
-      let%lwt () = Lwt_io.read_into_exactly s.ch header_box 0 34 in
+      let%lwt header_box = lwt_io_read s.ch 34 in
       let header = Secret_box.Bytes.secret_box_open s.key header_box s.nonce in
       assert (Bytes.length header = 18);
       match Bytes.equal header zero_header with
@@ -234,15 +242,12 @@ let client_hello ~epk =
 let client_handshake ~server_pk (ic,oc) =
   let (esk,epk) = Box.random_keypair () in
   let%lwt () = Lwt_io.write oc (client_hello ~epk) in
-  let server_hello = Bytes.create 64 in
-  let%lwt () = Lwt_io.read_into_exactly ic server_hello 0 64 in
-  let server_epk = verify_hello @@ Bytes.to_string server_hello in
+  let%lwt server_epk = Lwt.map verify_hello (lwt_io_read_s ic 64) in
   let shared_secrets = shared_secrets ~sk:secret ~esk ~server_pk ~server_epk in
   let (detached_sig_A,client_auth) = client_auth ~shared_secrets ~server_pk ~sk:secret ~pk:public in
   assert (Bytes.length client_auth = 112);
   let%lwt () = Lwt_io.write oc (Bytes.unsafe_to_string client_auth) in
-  let server_accept = Bytes.create 80 in
-  let%lwt () = Lwt_io.read_into_exactly ic server_accept 0 80 in
+  let%lwt server_accept = lwt_io_read ic 80 in
   let shared_key = client_verify ~shared_secrets ~detached_sig_A ~pk:public ~server_pk server_accept in
   Lwt.return @@ BoxStream.create (ic,oc) ~server_pk ~server_epk ~pk:public ~epk shared_key
 
@@ -251,23 +256,82 @@ end (* Handshake *)
 
 module RPC = struct
 
+type t = { input : Lwt_io.input_channel; output : Lwt_io.output_channel }
+
+(* allocates too much *)
+let create box_stream =
+  let output = Lwt_io.make ~close:(fun () -> BoxStream.goodbye box_stream) ~mode:Lwt_io.output
+    begin fun bytes ofs len ->
+      let b = Bytes.create len in
+      let () = Lwt_bytes.blit_to_bytes bytes ofs b 0 len in
+      let%lwt () = BoxStream.send box_stream (Bytes.unsafe_to_string b) in
+      Lwt.return len
+    end
+  in
+  let buffer = ref "" in
+  let input = Lwt_io.make ~mode:Lwt_io.input
+    begin fun bytes ofs len ->
+      let%lwt () =
+        if !buffer = "" then
+          Lwt.map ((:=) buffer) (try%lwt BoxStream.receive box_stream with BoxStream.Goodbye -> Lwt.return "")
+        else
+          Lwt.return_unit
+      in
+      match !buffer with
+      | "" -> Lwt.return 0 (* End_of_file *)
+      | _ ->
+        let to_blit = min len (String.length !buffer) in
+        Lwt_bytes.blit_from_bytes (Bytes.unsafe_of_string !buffer) 0 bytes ofs to_blit;
+        buffer := String.sub !buffer to_blit (String.length !buffer - to_blit);
+        Lwt.return to_blit
+    end
+  in
+  { input; output }
+
+type content_type = Binary | Utf8 | Json
+type header = { stream : bool; end_or_error : bool; typ : content_type; size : int; req_id : int32; }
+
+let read_header ch =
+  let%lwt h = lwt_io_read_s ch 9 in
+  let flags = Char.code h.[0] in
+  let typ = match flags land 3 with 0 -> Binary | 1 -> Utf8 | 2 -> Json | _ -> fail "bad content type in header" in
+  let stream = flags land 8 <> 0 in
+  let end_or_error = flags land 4 <> 0 in
+  let size = Unsigned.UInt32.(to_int @@ of_int32 @@ EndianString.BigEndian.get_int32 h 1) in
+  let req_id = EndianString.BigEndian.get_int32 h 5 in
+  Lwt.return { stream; end_or_error; typ; size; req_id; }
+
+let serialize_header { stream; end_or_error; typ; size; req_id } =
+  let h = Bytes.create 9 in
+  h.[0] <- Char.chr @@ (match typ with Binary -> 0 | Utf8 -> 1 | Json -> 2) lor (if end_or_error then 4 else 0) lor (if stream then 8 else 0);
+  EndianBytes.BigEndian.set_int32 h 1 Unsigned.UInt32.(to_int32 @@ of_int size);
+  EndianBytes.BigEndian.set_int32 h 5 req_id;
+  Bytes.unsafe_to_string h
+
+let yes = function true -> "yes" | false -> "no"
+let show_typ = function Binary -> "binary" | Utf8 -> "utf8" | Json -> "json"
+let show_header h = Printf.sprintf "stream:%s end:%s typ:%s size:%d req:%ld" (yes h.stream) (yes h.end_or_error) (show_typ h.typ) h.size h.req_id
+
+let read t =
+  let%lwt h = read_header t.input in
+  let%lwt s = lwt_io_read_s t.input h.size in
+  Lwt.return (h,s)
+
 end
 
 let execute_client ~server_pk c =
-  let%lwt box_stream = Handshake.client_handshake ~server_pk c in
-  printfn "verified";
-  let%lwt msg = BoxStream.receive box_stream in
-  printfn "received: %S" msg;
-  assert (String.length msg = 9);
-  let size = Unsigned.UInt32.(to_int @@ of_int32 @@ EndianString.BigEndian.get_int32 msg 1) in
-  printfn "size %d" size;
-  let%lwt msg = BoxStream.receive box_stream in
-  printfn "msg: %S" msg;
-  let%lwt () = BoxStream.send box_stream "\x0e\x00\x00\x00\x04\xff\xff\xff\xfftrue" in
-  printfn "answered";
+  let%lwt rpc = Lwt.map RPC.create @@ Handshake.client_handshake ~server_pk c in
+  let%lwt (h,msg) = RPC.read rpc in
+  printfn "> %s" (RPC.show_header h);
+  printfn "> %S" msg;
+  let a = RPC.{ stream=true; end_or_error=true; typ=Json; size=4; req_id=Int32.neg h.req_id; } in
+  let a' = RPC.serialize_header a in
+  let%lwt () = Lwt_io.write rpc.output (a' ^ "true") in
+  printfn "answered %S %s" a' (RPC.show_header a);
   while%lwt true do
-    let%lwt msg = BoxStream.receive box_stream in
-    printfn "msg: %S" msg;
+    let%lwt (h,msg) = RPC.read rpc in
+    printfn "> %s" (RPC.show_header h);
+    printfn "> %S" msg;
     Lwt.return_unit
   done
 
