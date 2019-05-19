@@ -21,9 +21,18 @@
  (flags (:standard -opaque))
  (modules version))
 
+; atd
+
+(rule
+  (targets ssb_t.mli ssb_t.ml ssb_j.mli ssb_j.ml)
+  (deps ssb.atd)
+  (action (progn (run %{bin:atdgen} -j -j-std %{deps}) (run %{bin:atdgen} -t %{deps}))))
+
+; main
+
 (executable
  (name ssb)
  ;(public_name ssb)
  (modules :standard \ gen_version version)
- (libraries extlib sodium lwt.unix atd lwt_ppx sha ocplib-endian integers version)
+ (libraries extlib sodium lwt.unix atdgen lwt_ppx sha ocplib-endian yojson integers version)
  (preprocess (pps lwt_ppx)))

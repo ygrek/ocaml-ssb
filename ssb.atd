@@ -1,0 +1,28 @@
+
+type json <ocaml module="Yojson.Safe" t="t"> = abstract
+
+type message = {
+  previous : string nullable;
+  author : string;
+  sequence : int;
+  timestamp : int;
+  hash : string;
+  content : json;
+}
+
+type 'a rpc_call = {
+  name : string list;
+  type_ <json name="type"> : string;
+  args : 'a list;
+}
+
+type createHistoryStream_args = {
+  id : string; (* Public key of the feed to return messages from. *)
+  ~sequence <ocaml default="0"> : int; (* Only return messages later than this sequence number. If not specified then start from the very beginning of the feed. *)
+  ?limit : int option; (* Maximum number of messages to return. If the limit is exceeded only the earliest messages are returned. Default: unlimited. *)
+  ~live <ocaml default="false">: bool; (* If true, keep the stream alive and send new messages as they are posted. If false, end the stream after messages are sent and don’t wait for new ones. *)
+  ~old <ocaml default="true">: bool; (* Used together with live. If true, start by sending existing messages already posted by this feed. If false, don’t send existing messages posted by this feed, only send new messages as they arrive. *)
+  ~keys <ocaml default="true">: bool; (* If true, also include message IDs and timestamps of when each message was received by this peer. If false, just send the messages themselves. *)
+}
+
+type createHistoryStream = createHistoryStream_args rpc_call

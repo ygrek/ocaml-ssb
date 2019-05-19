@@ -315,23 +315,48 @@ let show_header h = Printf.sprintf "stream:%s end:%s typ:%s size:%d req:%ld" (ye
 let read t =
   let%lwt h = read_header t.input in
   let%lwt s = lwt_io_read_s t.input h.size in
+  printfn "> %s" (show_header h);
+  printfn "> %s" s;
   Lwt.return (h,s)
+
+let write t (h,msg) =
+  printfn ": %s" (show_header h);
+  printfn ": %s" msg;
+  let%lwt () = Lwt_io.write t.output (serialize_header h) in
+  let%lwt () = Lwt_io.write t.output msg in
+  let%lwt () = Lwt_io.flush t.output in
+  Lwt.return_unit
 
 end
 
+let createHistoryStream rpc =
+  let body = Ssb_j.string_of_createHistoryStream {
+    name=["createHistoryStream"];
+    type_="source";
+    args=[
+      {
+        id="@nRlzaYFcYB6X2QevJ3MZrgJnhozOesb4hrd7ENK4PS4=.ed25519";
+        sequence=0;
+        limit=None;
+        old=true;
+        live=true;
+        keys=true;
+      }
+    ]
+  }
+  in
+  let h = RPC.{ stream=true; end_or_error=false; req_id=1l; typ=Json; size=String.length body } in
+  RPC.write rpc (h,body)
+
+
 let execute_client ~server_pk c =
   let%lwt rpc = Lwt.map RPC.create @@ Handshake.client_handshake ~server_pk c in
-  let%lwt (h,msg) = RPC.read rpc in
-  printfn "> %s" (RPC.show_header h);
-  printfn "> %S" msg;
+  let%lwt (h,_) = RPC.read rpc in
   let a = RPC.{ stream=true; end_or_error=true; typ=Json; size=4; req_id=Int32.neg h.req_id; } in
-  let a' = RPC.serialize_header a in
-  let%lwt () = Lwt_io.write rpc.output (a' ^ "true") in
-  printfn "answered %S %s" a' (RPC.show_header a);
+  let%lwt () = RPC.write rpc (a,"true") in
+  let%lwt () = createHistoryStream rpc in
   while%lwt true do
-    let%lwt (h,msg) = RPC.read rpc in
-    printfn "> %s" (RPC.show_header h);
-    printfn "> %S" msg;
+    let%lwt _ = RPC.read rpc in
     Lwt.return_unit
   done
 
