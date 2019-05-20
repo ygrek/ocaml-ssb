@@ -5,9 +5,15 @@ type message = {
   previous : string nullable;
   author : string;
   sequence : int;
-  timestamp : int;
+  timestamp : float;
   hash : string;
   content : json;
+}
+
+type kv_message = {
+  key : string;
+  value : message;
+  timestamp : float;
 }
 
 type 'a rpc_call = {

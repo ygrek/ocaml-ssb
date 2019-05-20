@@ -253,7 +253,7 @@ let client_handshake ~network_key ~server_pk (ic,oc) =
 end (* Handshake *)
 
 
-module RPC = struct
+module RPC_raw = struct
 
 type t = { input : Lwt_io.input_channel; output : Lwt_io.output_channel }
 
@@ -331,6 +331,83 @@ end
 let show_feed_id pk =
   sprintf "@%s=.ed25519" @@ Base64.encode_string @@ Bytes.unsafe_to_string @@ Sign.Bytes.of_public_key pk
 
+module RPC = struct
+
+type conn = { mutable last_req : int32; rpc : RPC_raw.t; handlers : (int32, (RPC_raw.header -> string -> unit Lwt.t)) Hashtbl.t; stop : unit Lwt.u }
+
+let start box_stream on_request =
+  let rpc = RPC_raw.create box_stream in
+  let handlers = Hashtbl.create 10 in
+  let handle f h body =
+    try%lwt
+      f h body
+    with exn ->
+      eprintfn "W: req_id %ld handler exn : %s" h.RPC_raw.req_id (Printexc.to_string exn);
+      Lwt.return_unit
+  in
+  let (should_stop, stop) = Lwt.wait () in
+  let exception Break in
+  Lwt.async begin fun () ->
+    try%lwt
+      while%lwt true do
+        let%lwt (h,body) = Lwt.pick [Lwt.bind should_stop (fun () -> Lwt.fail Break); RPC_raw.read rpc] in
+        match Int32.compare h.req_id 0l > 0 with
+        | true -> handle on_request h body
+        | false ->
+        match Hashtbl.find handlers (Int32.neg h.req_id) with
+        | exception Not_found -> eprintfn "W: req_id %ld unknown, ignoring" h.req_id; Lwt.return_unit
+        | f -> handle f h body
+      done
+    with
+    | Break -> Lwt.return_unit
+    | exn -> eprintfn "E: RPC unexpected exn : %s" (Printexc.to_string exn); Lwt.return_unit
+  end;
+  { last_req = 0l; rpc; handlers; stop }
+
+let stop rpc = Lwt.wakeup rpc.stop ()
+
+let bracket rpc f = Lwt.finalize f (fun () -> stop rpc; Lwt.return_unit)
+
+let new_request conn =
+  conn.last_req <- Int32.succ conn.last_req;
+  conn.last_req
+
+let send_stream_end conn ?error req_id =
+  let body = Option.map_default Yojson.Safe.to_string "true" error in
+  let a = RPC_raw.{ stream=true; end_or_error=true; typ=Json; size=String.length body; req_id=Int32.neg req_id; } in
+  RPC_raw.write conn.rpc (a,body)
+
+let source conn body =
+  let (stream,push) = Lwt_stream.create () in
+  let req_id = new_request conn in
+  Hashtbl.add conn.handlers req_id (fun h body -> push (Some (h,body)); Lwt.return_unit);
+  let h = RPC_raw.{ stream=true; end_or_error=false; req_id; typ=Json; size=String.length body } in
+  let%lwt () = RPC_raw.write conn.rpc (h,body) in
+  Lwt.return (stream,req_id)
+
+let source conn body =
+  let%lwt (incoming,req_id) = source conn body in
+  Lwt.return @@ Lwt_stream.from begin fun () ->
+    let%lwt (h,body) = Lwt_stream.next incoming in
+    if h.end_or_error then
+    begin
+      Hashtbl.remove conn.handlers req_id;
+      let%lwt () = send_stream_end conn req_id in
+      Lwt.return None
+    end
+    else
+    if not h.stream then
+    begin
+      Hashtbl.remove conn.handlers req_id;
+      let%lwt () = send_stream_end conn ~error:(`Assoc ["error",`String "expected stream"]) req_id in
+      Lwt.return None (* FIXME should wait for end from the other side *)
+    end
+    else
+    Lwt.return (Some body)
+  end
+
+end
+
 let createHistoryStream rpc pk =
   let body = Ssb_j.string_of_createHistoryStream {
     name=["createHistoryStream"];
@@ -347,20 +424,21 @@ let createHistoryStream rpc pk =
     ]
   }
   in
-  let h = RPC.{ stream=true; end_or_error=false; req_id=1l; typ=Json; size=String.length body } in
-  RPC.write rpc (h,body)
+  RPC.source rpc body |> Lwt.map (Lwt_stream.map Ssb_j.kv_message_of_string)
 
+let with_stream_iter s k =
+  try%lwt
+    let%lwt s = s in
+    Lwt_stream.iter k s
+  with exn -> eprintfn "E: with_stream_iter : %s" (Printexc.to_string exn); Lwt.return_unit
 
 let execute_client ~network_key ~server_pk c =
-  let%lwt rpc = Lwt.map RPC.create @@ Handshake.client_handshake ~network_key ~server_pk c in
-  let%lwt (h,_) = RPC.read rpc in
-  let a = RPC.{ stream=true; end_or_error=true; typ=Json; size=4; req_id=Int32.neg h.req_id; } in
-  let%lwt () = RPC.write rpc (a,"true") in
-  let%lwt () = createHistoryStream rpc server_pk in
-  while%lwt true do
-    let%lwt _ = RPC.read rpc in
+  let%lwt box_stream = Handshake.client_handshake ~network_key ~server_pk c in
+  let rpc = RPC.start box_stream begin fun _ _ -> eprintfn "some new req"; Lwt.return_unit end in
+  RPC.bracket rpc begin fun () ->
+    let%lwt () = with_stream_iter (createHistoryStream rpc server_pk) (fun body -> eprintfn "got %s" (Yojson.Safe.to_string body.value.content)) in
     Lwt.return_unit
-  done
+  end
 
 let test_main () =
 (*     "\xd4\xa1\xcb\x88\xa6\x6f\x02\xf8\xdb\x63\x5c\xe2\x64\x41\xcc\x5d\xac\x1b\x08\x42\x0c\xea\xac\x23\x08\x39\xb7\x55\x84\x5a\x9f\xfb" *)
@@ -373,7 +451,8 @@ let test_test () =
   let my_testnet = Auth.Bytes.to_key @@ Bytes.of_string @@ Base64.decode_string "v8Ofith0tgBWOzodXDaX7V77onfyY5uHPUCaA4pUgZA" in
   (* net:192.168.1.40:8007~shs:HocXLrFajVIqsJRrz3aek+Sdk4I1mEAhZhthzHIz1+0= *)
   let server_pk = Sign.Bytes.to_public_key @@ Bytes.of_string @@ Base64.decode_string "HocXLrFajVIqsJRrz3aek+Sdk4I1mEAhZhthzHIz1+0" in
-  Lwt_io.with_connection Unix.(ADDR_INET (inet_addr_of_string "192.168.1.40",8007)) (execute_client ~network_key:my_testnet ~server_pk)
+  let%lwt () = Lwt_io.with_connection Unix.(ADDR_INET (inet_addr_of_string "192.168.1.40",8007)) (execute_client ~network_key:my_testnet ~server_pk) in
+  Lwt.return_unit
 
 let () =
   match Sys.argv |> Array.to_list |> List.tl with
