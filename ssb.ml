@@ -408,6 +408,29 @@ let source conn body =
 
 end
 
+let json_stringify json =
+  let buf = Bi_outbuf.create 10 in
+  let pr = Bi_outbuf.add_string buf in
+  let indent level = pr @@ String.make level ' ' in
+  let rec show level x =
+    match x with
+    | `String _ | `Int _ | `Null | `Bool _ | `Float _ -> Yojson.Basic.write_std_json buf x
+    | `Assoc [] -> pr "{}"
+    | `Assoc x ->
+      pr "{\n";
+      x |> List.iteri (fun i (k,v) -> indent (level + 2); show 0 (`String k); pr ": "; show (level + 2) v; if i + 1 <> List.length x then pr ","; pr "\n");
+      indent level;
+      pr "}"
+    | `List [] -> pr "[]"
+    | `List l ->
+      pr "[\n";
+      l |> List.iteri (fun i x -> indent (level + 2); show (level + 2) x; if i + 1 <> List.length l then pr ","; pr "\n");
+      indent level;
+      pr "]"
+  in
+  show 0 json;
+  Bi_outbuf.contents buf
+
 let createHistoryStream rpc pk =
   let body = Ssb_j.string_of_createHistoryStream {
     name=["createHistoryStream"];
@@ -424,7 +447,31 @@ let createHistoryStream rpc pk =
     ]
   }
   in
-  RPC.source rpc body |> Lwt.map (Lwt_stream.map Ssb_j.kv_message_of_string)
+  RPC.source rpc body |> Lwt.map (Lwt_stream.map Ssb_j.kv_json_of_string)
+
+let chop_suffix s suffix =
+  if not (String.ends_with s suffix) then fail "no suffix %S" suffix;
+  String.slice ~last:(-String.length suffix) s
+
+let verify_message pk m =
+  try
+    let m = match m with `Assoc m -> m | _ -> fail "not an object" in
+    let (signature,signature_s) =
+      try
+        let s = match List.assoc "signature" m with `String s -> s | _ -> fail "not a string" in
+        Sign.Bytes.to_signature @@ Bytes.unsafe_of_string @@ Base64.decode_string @@ chop_suffix s "==.sig.ed25519", s
+      with exn -> fail ~exn "bad signature"
+    in
+    (* FIXME duplicate and extra fields *)
+    let canonical = json_stringify @@ `Assoc (List.filter (fun (k,_) -> k <> "signature") m) in
+    Sign.Bytes.verify pk signature (Bytes.unsafe_of_string canonical);
+    let key =
+      let s = chop_suffix canonical "\n}" ^ ",\n  \"signature\": \"" ^ signature_s ^ "\"\n}" in
+      sprintf "%%%s=.sha256" (Base64.encode_string @@ Sha256.(to_bin @@ string s))
+    in
+    key, Ssb_j.message_of_string canonical
+  with exn ->
+    fail ~exn "verify_message : bad message"
 
 let with_stream_iter s k =
   try%lwt
@@ -436,7 +483,12 @@ let execute_client ~network_key ~server_pk c =
   let%lwt box_stream = Handshake.client_handshake ~network_key ~server_pk c in
   let rpc = RPC.start box_stream begin fun _ _ -> eprintfn "some new req"; Lwt.return_unit end in
   RPC.bracket rpc begin fun () ->
-    let%lwt () = with_stream_iter (createHistoryStream rpc server_pk) (fun body -> eprintfn "got %s" (Yojson.Safe.to_string body.value.content)) in
+    let%lwt () = with_stream_iter (createHistoryStream rpc server_pk) begin fun body ->
+      match verify_message server_pk body.value with
+      | key, msg when String.equal key body.key -> eprintfn "got %s (signature ok, id matches)" (Yojson.Basic.to_string msg.content)
+      | key, _ -> eprintfn "signature ok, but bad id on message %s : expected %s" (Yojson.Basic.to_string body.value) key
+      | exception exn -> eprintfn "bad signature on message %s : %s" (Yojson.Basic.to_string body.value) (Printexc.to_string exn)
+    end in
     Lwt.return_unit
   end
 
@@ -459,4 +511,5 @@ let () =
   | "-v"::[] -> print_endline Version.id
   | "main"::[] -> Lwt_main.run @@ test_main ()
   | "test"::[] -> Lwt_main.run @@ test_test ()
+  | "stringify"::[] -> print_endline @@ json_stringify @@ Yojson.Basic.from_string @@ Std.input_all stdin
   | _ -> fail "wut?"

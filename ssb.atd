@@ -1,5 +1,5 @@
 
-type json <ocaml module="Yojson.Safe" t="t"> = abstract
+type json <ocaml module="Yojson.Basic" t="t"> = abstract
 
 type message = {
   previous : string nullable;
@@ -10,11 +10,19 @@ type message = {
   content : json;
 }
 
-type kv_message = {
+type signed_message = {
+  inherit message;
+  signature : string;
+}
+
+type 'a kv = {
   key : string;
-  value : message;
+  value : 'a;
   timestamp : float;
 }
+
+type kv_message = message kv
+type kv_json = json kv
 
 type 'a rpc_call = {
   name : string list;
