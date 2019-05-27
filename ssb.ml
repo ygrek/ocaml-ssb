@@ -3,14 +3,11 @@ open Sodium
 open ExtLib
 open Prelude
 
-let secret = Sign.Bytes.to_secret_key @@ Bytes.of_string "\2335S\011\n\206\1273`4\174E\0294,\184\163\222\183\231\255\1984\022\131f5\165W\001Z\024\135P\027\137\220\239\n\229\130\201\178\222Yq\190G\187w\210\191he\228\015\1507\139\151\209\014\155\020"
-(* h1AbidzvCuWCybLeWXG+R7t30r9oZeQPljeLl9EOmxQ= *)
-let public = Sign.Bytes.to_public_key @@ Bytes.of_string "\135P\027\137\220\239\n\229\130\201\178\222Yq\190G\187w\210\191he\228\015\1507\139\151\209\014\155\020"
-
 let concat_s l = String.concat "" (List.map Bytes.unsafe_to_string l)
 let concat l = Bytes.unsafe_of_string @@ concat_s l
 
 let sha256 x = Bytes.unsafe_of_string @@ Sha256.(to_bin @@ string @@ Bytes.to_string x)
+let debase64 s = Bytes.unsafe_of_string @@ Base64.decode_string @@ String.strip ~chars:"=" s
 
 let lwt_io_read ch n =
   assert (n > 0);
@@ -25,15 +22,18 @@ module BoxStream = struct
   exception Goodbye
 
   type 'a stream = { ch : 'a Lwt_io.channel; key : Secret_box.secret_key; mutable nonce : Secret_box.nonce; }
-  type t = { mutable input : Lwt_io.input stream option; mutable output : Lwt_io.output stream option; }
+  type t = { their_pk : Sign.public_key; mutable input : Lwt_io.input stream option; mutable output : Lwt_io.output stream option; }
 
-  let create (ic,oc) ~network_key ~server_pk ~server_epk ~pk ~epk key =
+  let create (ic,oc) ~network_key ~their_pk ~their_epk ~pk ~epk key =
     let make_key pk = Secret_box.Bytes.to_key @@ sha256 @@ concat [sha256 @@ sha256 key; Sign.Bytes.of_public_key pk] in
     let make_nonce epk = Secret_box.Bytes.to_nonce @@ Bytes.sub Auth.Bytes.(of_auth @@ auth network_key (Box.Bytes.of_public_key epk)) 0 24 in
     {
+      their_pk;
       input = Some { ch = ic; key = make_key pk; nonce = make_nonce epk };
-      output = Some { ch = oc; key = make_key server_pk; nonce = make_nonce server_epk }
+      output = Some { ch = oc; key = make_key their_pk; nonce = make_nonce their_epk }
     }
+
+  let their_pk t = t.their_pk
 
   let send s body =
     let size = String.length body in
@@ -102,73 +102,30 @@ end
 
 module Handshake = struct
 
-(*
-assert(length(msg2) == 64)
+let zero_nonce = Secret_box.nonce_of_bytes @@ Bytes.make 24 '\x00'
 
-server_hmac = first_32_bytes(msg2)
-server_ephemeral_pk = last_32_bytes(msg2)
-
-assert_nacl_auth_verify(
-  authenticator: server_hmac,
-  msg: server_ephemeral_pk,
-  key: network_identifier
-)
-*)
 let verify_hello ~network_key s =
-   if String.length s <> 64 then fail "verify_hello: length %d expected 64" (String.length s);
+   assert (String.length s = 64);
    let hmac = String.slice ~last:32 s in
    let pk = String.slice ~first:32 s in
    Auth.Bytes.(verify network_key (to_auth @@ Bytes.of_string hmac) (Bytes.of_string pk));
    Box.Bytes.to_public_key @@ Bytes.of_string pk
 
-(*
-shared_secret_ab = nacl_scalarmult(
-  client_ephemeral_sk,
-  server_ephemeral_pk
-)
-
-shared_secret_aB = nacl_scalarmult(
-  client_ephemeral_sk,
-  pk_to_curve25519(server_longterm_pk)
-)
-
-shared_secret_Ab = nacl_scalarmult(
-  sk_to_curve25519(client_longterm_sk),
-  server_ephemeral_pk
-)
-*)
-let shared_secrets ~sk ~esk ~server_pk ~server_epk =
+let init_shared_secrets ~sk ~esk ~their_epk =
   let open Scalar_mult in
-  let esk = Bytes.to_integer @@ Box.Bytes.of_secret_key esk in
-  let server_epk = Bytes.to_group_elt @@ Box.Bytes.of_public_key server_epk in
-  Bytes.of_group_elt @@ mult esk server_epk,
-  Bytes.of_group_elt @@ mult esk (Bytes.to_group_elt @@ Box.Bytes.of_public_key @@ Sign.box_public_key server_pk),
-  Bytes.of_group_elt @@ mult (Bytes.to_integer @@ Box.Bytes.of_secret_key @@ Sign.box_secret_key sk) server_epk
+  let their_epk = Bytes.to_group_elt @@ Box.Bytes.of_public_key their_epk in
+  Bytes.of_group_elt @@ mult (Bytes.to_integer @@ Box.Bytes.of_secret_key esk) their_epk,
+  Bytes.of_group_elt @@ mult (Bytes.to_integer @@ Box.Bytes.of_secret_key @@ Sign.box_secret_key sk) their_epk
 
-(*
-detached_signature_A = nacl_sign_detached(
-  msg: concat(
-    network_identifier,
-    server_longterm_pk,
-    sha256(shared_secret_ab)
-  ),
-  key: client_longterm_sk
-)
-nacl_secret_box(
-  msg: concat(
-    detached_signature_A,
-    client_longterm_pk
-  ),
-  nonce: 24_bytes_of_zeros,
-  key: sha256(
-    concat(
-      network_identifier,
-      shared_secret_ab,
-      shared_secret_aB
-    )
-  )
-)
-*)
+let last_shared_secret ~esk ~their_pk =
+  let open Scalar_mult in
+  Bytes.of_group_elt @@ mult (Bytes.to_integer @@ Box.Bytes.of_secret_key esk) (Bytes.to_group_elt @@ Box.Bytes.of_public_key @@ Sign.box_public_key their_pk)
+
+let client_shared_secrets ~sk ~esk ~server_pk ~server_epk =
+  let (ss_ab,ss_Ab) = init_shared_secrets ~sk ~esk ~their_epk:server_epk in
+  let ss_aB = last_shared_secret ~esk ~their_pk:server_pk in
+  (ss_ab,ss_aB,ss_Ab)
+
 let client_auth ~network_key ~shared_secrets:(ss_ab,ss_aB,_) ~server_pk ~sk ~pk =
   let detached_sig_A = Sign.Bytes.sign_detached sk (concat [
     Auth.Bytes.of_key network_key;
@@ -182,32 +139,42 @@ let client_auth ~network_key ~shared_secrets:(ss_ab,ss_aB,_) ~server_pk ~sk ~pk 
     ss_aB;
   ] in
   detached_sig_A,
-  Secret_box.Bytes.secret_box key (concat [Sign.Bytes.of_signature detached_sig_A; Sign.Bytes.of_public_key pk]) (Secret_box.nonce_of_bytes @@ Bytes.make 24 '\x00')
+  Secret_box.Bytes.secret_box key (concat [Sign.Bytes.of_signature detached_sig_A; Sign.Bytes.of_public_key pk]) zero_nonce
 
-(*
-detached_signature_B = assert_nacl_secretbox_open(
-  ciphertext: msg4,
-  nonce: 24_bytes_of_zeros,
-  key: sha256(
-    concat(
-      network_identifier,
-      shared_secret_ab,
-      shared_secret_aB,
-      shared_secret_Ab
-    )
-  )
-)
-assert_nacl_sign_verify_detached(
-  sig: detached_signature_B,
-  msg: concat(
-    network_identifier,
-    detached_signature_A,
-    client_longterm_pk,
-    sha256(shared_secret_ab)
-  ),
-  key: server_longterm_pk
-)
-*)
+let server_verify ~network_key ~shared_secrets:(ss_ab,ss_aB) msg ~pk =
+  let key = concat [
+    Auth.Bytes.of_key network_key;
+    ss_ab;
+    ss_aB;
+  ] in
+  let msg = Secret_box.Bytes.secret_box_open (Secret_box.Bytes.to_key @@ sha256 key) msg zero_nonce in
+  assert (Bytes.length msg = 96);
+  let detached_sig_A = Sign.Bytes.to_signature @@ Bytes.sub msg 0 64 in
+  let client_pk = Sign.Bytes.to_public_key @@ Bytes.sub msg 64 32 in
+  let verify = concat [
+    Auth.Bytes.of_key network_key;
+    Sign.Bytes.of_public_key pk;
+    sha256 ss_ab;
+  ] in
+  Sign.Bytes.verify client_pk detached_sig_A verify;
+  client_pk, detached_sig_A
+
+let server_accept ~network_key ~shared_secrets:(ss_ab,ss_aB,ss_Ab) ~detached_sig_A ~sk ~client_pk =
+  let detached_sig_B = Sign.Bytes.sign_detached sk (concat [
+    Auth.Bytes.of_key network_key;
+    Sign.Bytes.of_signature detached_sig_A;
+    Sign.Bytes.of_public_key client_pk;
+    sha256 @@ ss_ab;
+  ])
+  in
+  let key = concat [
+    Auth.Bytes.of_key network_key;
+    ss_ab;
+    ss_aB;
+    ss_Ab;
+  ] in
+  key, Secret_box.Bytes.secret_box (Secret_box.Bytes.to_key @@ sha256 key) (Sign.Bytes.of_signature detached_sig_B) zero_nonce
+
 let client_verify ~network_key ~shared_secrets:(ss_ab,ss_aB,ss_Ab) ~detached_sig_A ~pk ~server_pk msg =
   let key = concat [
     Auth.Bytes.of_key network_key;
@@ -215,7 +182,7 @@ let client_verify ~network_key ~shared_secrets:(ss_ab,ss_aB,ss_Ab) ~detached_sig
     ss_aB;
     ss_Ab;
   ] in
-  let detached_sig_B = Secret_box.Bytes.secret_box_open (Secret_box.Bytes.to_key @@ sha256 key) msg (Secret_box.nonce_of_bytes @@ Bytes.make 24 '\x00') in
+  let detached_sig_B = Secret_box.Bytes.secret_box_open (Secret_box.Bytes.to_key @@ sha256 key) msg zero_nonce in
   let verify = concat [
     Auth.Bytes.of_key network_key;
     Sign.Bytes.of_signature detached_sig_A;
@@ -234,24 +201,36 @@ concat(
   client_ephemeral_pk
 )
 *)
-let client_hello ~network_key ~epk =
+let hello ~network_key ~epk =
   let epk = Box.Bytes.of_public_key epk in
   concat_s [Auth.Bytes.(of_auth @@ auth network_key epk); epk]
 
-let client_handshake ~network_key ~server_pk (ic,oc) =
+let client_handshake ~network_key ~server_pk (ic,oc) (sk,pk) =
   let (esk,epk) = Box.random_keypair () in
-  let%lwt () = Lwt_io.write oc (client_hello ~network_key ~epk) in
+  let%lwt () = Lwt_io.write oc (hello ~network_key ~epk) in
   let%lwt server_epk = Lwt.map (verify_hello ~network_key) (lwt_io_read_s ic 64) in
-  let shared_secrets = shared_secrets ~sk:secret ~esk ~server_pk ~server_epk in
-  let (detached_sig_A,client_auth) = client_auth ~network_key ~shared_secrets ~server_pk ~sk:secret ~pk:public in
+  let shared_secrets = client_shared_secrets ~sk ~esk ~server_pk ~server_epk in
+  let (detached_sig_A,client_auth) = client_auth ~network_key ~shared_secrets ~server_pk ~sk ~pk in
   assert (Bytes.length client_auth = 112);
   let%lwt () = Lwt_io.write oc (Bytes.unsafe_to_string client_auth) in
   let%lwt server_accept = lwt_io_read ic 80 in
-  let shared_key = client_verify ~network_key ~shared_secrets ~detached_sig_A ~pk:public ~server_pk server_accept in
-  Lwt.return @@ BoxStream.create (ic,oc) ~network_key ~server_pk ~server_epk ~pk:public ~epk shared_key
+  let shared_key = client_verify ~network_key ~shared_secrets ~detached_sig_A ~pk ~server_pk server_accept in
+  Lwt.return @@ BoxStream.create (ic,oc) ~network_key ~their_pk:server_pk ~their_epk:server_epk ~pk ~epk shared_key
+
+let server_handshake ~network_key (ic,oc) (sk,pk) =
+  let%lwt client_epk = Lwt.map (verify_hello ~network_key) (lwt_io_read_s ic 64) in
+  let (esk,epk) = Box.random_keypair () in
+  let%lwt () = Lwt_io.write oc (hello ~network_key ~epk) in
+  let (ss_ab,ss_aB) = init_shared_secrets ~sk ~esk ~their_epk:client_epk in
+  let%lwt msg3 = lwt_io_read ic 112 in
+  let (client_pk,detached_sig_A) = server_verify ~network_key ~shared_secrets:(ss_ab,ss_aB) msg3 ~pk in
+  let ss_Ab = last_shared_secret ~esk ~their_pk:client_pk in
+  let (shared_key,accept) = server_accept ~network_key ~shared_secrets:(ss_ab,ss_aB,ss_Ab) ~detached_sig_A ~sk ~client_pk in
+  assert (Bytes.length accept = 80);
+  let%lwt () = Lwt_io.write oc (Bytes.unsafe_to_string accept) in
+  Lwt.return @@ BoxStream.create (ic,oc) ~network_key ~their_pk:client_pk ~their_epk:client_epk ~pk ~epk shared_key
 
 end (* Handshake *)
-
 
 module RPC_raw = struct
 
@@ -459,7 +438,7 @@ let verify_message pk m =
     let (signature,signature_s) =
       try
         let s = match List.assoc "signature" m with `String s -> s | _ -> fail "not a string" in
-        Sign.Bytes.to_signature @@ Bytes.unsafe_of_string @@ Base64.decode_string @@ chop_suffix s "==.sig.ed25519", s
+        Sign.Bytes.to_signature @@ debase64 @@ chop_suffix s ".sig.ed25519", s
       with exn -> fail ~exn "bad signature"
     in
     (* FIXME duplicate and extra fields *)
@@ -479,8 +458,8 @@ let with_stream_iter s k =
     Lwt_stream.iter k s
   with exn -> eprintfn "E: with_stream_iter : %s" (Printexc.to_string exn); Lwt.return_unit
 
-let execute_client ~network_key ~server_pk c =
-  let%lwt box_stream = Handshake.client_handshake ~network_key ~server_pk c in
+let execute_client ~network_key ~server_pk identity c =
+  let%lwt box_stream = Handshake.client_handshake ~network_key ~server_pk c identity in
   let rpc = RPC.start box_stream begin fun _ _ -> eprintfn "some new req"; Lwt.return_unit end in
   RPC.bracket rpc begin fun () ->
     let%lwt () = with_stream_iter (createHistoryStream rpc server_pk) begin fun body ->
@@ -492,18 +471,59 @@ let execute_client ~network_key ~server_pk c =
     Lwt.return_unit
   end
 
+let show_sockaddr = let open Unix in function
+  | ADDR_UNIX s -> sprintf "unix:%s" s
+  | ADDR_INET (addr,port) -> sprintf "%s:%u" (string_of_inet_addr addr) port
+
+let wait_forever () =
+  let (w,_) = Lwt.wait () in
+  Lwt.bind w Lwt.return
+
+let execute_server ~network_key sockaddr identity =
+  let handler addr c =
+    eprintfn "I: %s connected" (show_sockaddr addr);
+    try%lwt
+      let%lwt box_stream = Handshake.server_handshake ~network_key c identity in
+      let rpc = RPC.start box_stream begin fun _ _ -> eprintfn "some new req"; Lwt.return_unit end in
+      let their_pk = BoxStream.their_pk box_stream in
+      RPC.bracket rpc begin fun () ->
+        let%lwt () = with_stream_iter (createHistoryStream rpc their_pk) begin fun body ->
+          match verify_message their_pk body.value with
+          | key, msg when String.equal key body.key -> eprintfn "got %s (signature ok, id matches)" (Yojson.Basic.to_string msg.content)
+          | key, _ -> eprintfn "signature ok, but bad id on message %s : expected %s" (Yojson.Basic.to_string body.value) key
+          | exception exn -> eprintfn "bad signature on message %s : %s" (Yojson.Basic.to_string body.value) (Printexc.to_string exn)
+        end in
+        Lwt.return_unit
+      end
+    with
+      exn -> eprintfn "W: %s exn : %s" (show_sockaddr addr) (Printexc.to_string exn); Lwt.return_unit
+  in
+  let%lwt _server = Lwt_io.establish_server_with_client_address sockaddr handler in
+  wait_forever ()
+
+let identity =
+  let sk = Sign.Bytes.to_secret_key @@ debase64 "6TVTCwrOfzNgNK5FHTQsuKPet+f/xjQWg2Y1pVcBWhiHUBuJ3O8K5YLJst5Zcb5Hu3fSv2hl5A+WN4uX0Q6bFA" in
+  let pk = Sign.Bytes.to_public_key @@ debase64 "h1AbidzvCuWCybLeWXG+R7t30r9oZeQPljeLl9EOmxQ" in
+  (sk,pk)
+
+let server_identity =
+  let sk = Sign.Bytes.to_secret_key @@ debase64 "Ny65JFiqhcWukM0dK9gkgMFMxgyNdhxoqzE3VNEaNtQehxcusVqNUiqwlGvPdp6T5J2TgjWYQCFmG2HMcjPX7Q" in
+  let pk = Sign.Bytes.to_public_key @@ debase64 "HocXLrFajVIqsJRrz3aek+Sdk4I1mEAhZhthzHIz1+0" in
+  (sk,pk)
+
+let main_network = Auth.Bytes.to_key @@ debase64 "1KHLiKZvAvjbY1ziZEHMXawbCEIM6qwjCDm3VYRan/s"
+let my_testnet = Auth.Bytes.to_key @@ debase64 "v8Ofith0tgBWOzodXDaX7V77onfyY5uHPUCaA4pUgZA"
+
 let test_main () =
 (*     "\xd4\xa1\xcb\x88\xa6\x6f\x02\xf8\xdb\x63\x5c\xe2\x64\x41\xcc\x5d\xac\x1b\x08\x42\x0c\xea\xac\x23\x08\x39\xb7\x55\x84\x5a\x9f\xfb" *)
-  let main_network = Auth.Bytes.to_key @@ Bytes.of_string @@ Base64.decode_string "1KHLiKZvAvjbY1ziZEHMXawbCEIM6qwjCDm3VYRan/s" in
   (* net:192.168.1.40:8008~shs:nRlzaYFcYB6X2QevJ3MZrgJnhozOesb4hrd7ENK4PS4= *)
-  let server_pk = Sign.Bytes.to_public_key @@ Bytes.of_string @@ Base64.decode_string "nRlzaYFcYB6X2QevJ3MZrgJnhozOesb4hrd7ENK4PS4" in
-  Lwt_io.with_connection Unix.(ADDR_INET (inet_addr_of_string "192.168.1.40",8008)) (execute_client ~network_key:main_network ~server_pk)
+  let server_pk = Sign.Bytes.to_public_key @@ debase64 "nRlzaYFcYB6X2QevJ3MZrgJnhozOesb4hrd7ENK4PS4" in
+  Lwt_io.with_connection Unix.(ADDR_INET (inet_addr_loopback,8008)) (execute_client ~network_key:main_network ~server_pk identity)
 
 let test_test () =
-  let my_testnet = Auth.Bytes.to_key @@ Bytes.of_string @@ Base64.decode_string "v8Ofith0tgBWOzodXDaX7V77onfyY5uHPUCaA4pUgZA" in
   (* net:192.168.1.40:8007~shs:HocXLrFajVIqsJRrz3aek+Sdk4I1mEAhZhthzHIz1+0= *)
-  let server_pk = Sign.Bytes.to_public_key @@ Bytes.of_string @@ Base64.decode_string "HocXLrFajVIqsJRrz3aek+Sdk4I1mEAhZhthzHIz1+0" in
-  let%lwt () = Lwt_io.with_connection Unix.(ADDR_INET (inet_addr_of_string "192.168.1.40",8007)) (execute_client ~network_key:my_testnet ~server_pk) in
+  let server_pk = Sign.Bytes.to_public_key @@ debase64 "HocXLrFajVIqsJRrz3aek+Sdk4I1mEAhZhthzHIz1+0" in
+  let%lwt () = Lwt_io.with_connection Unix.(ADDR_INET (inet_addr_loopback,8007)) (execute_client ~network_key:my_testnet ~server_pk identity) in
   Lwt.return_unit
 
 let () =
@@ -511,5 +531,6 @@ let () =
   | "-v"::[] -> print_endline Version.id
   | "main"::[] -> Lwt_main.run @@ test_main ()
   | "test"::[] -> Lwt_main.run @@ test_test ()
+  | "server"::[] -> Lwt_main.run @@ execute_server ~network_key:my_testnet Unix.(ADDR_INET (inet_addr_loopback, 8007)) server_identity
   | "stringify"::[] -> print_endline @@ json_stringify @@ Yojson.Basic.from_string @@ Std.input_all stdin
   | _ -> fail "wut?"
