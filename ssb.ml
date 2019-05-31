@@ -385,6 +385,22 @@ let source conn body =
     Lwt.return (Some body)
   end
 
+exception Error of string
+
+let async conn body =
+  let req_id = new_request conn in
+  let (wait,wake) = Lwt.wait () in
+  Hashtbl.add conn.handlers req_id begin fun h body ->
+    Hashtbl.remove conn.handlers req_id;
+    Lwt.return @@
+      if h.end_or_error then Lwt.wakeup_later_exn wake (Error body)
+      else if h.stream then Lwt.wakeup_later_exn wake (Error "unexpected stream response to async request")
+      else Lwt.wakeup_later wake body
+  end;
+  let h = RPC_raw.{ stream=false; end_or_error=false; req_id; typ=Json; size=String.length body } in
+  let%lwt () = RPC_raw.write conn.rpc (h,body) in
+  wait
+
 end
 
 let json_stringify json =
@@ -427,6 +443,15 @@ let createHistoryStream rpc pk =
   }
   in
   RPC.source rpc body |> Lwt.map (Lwt_stream.map Ssb_j.kv_json_of_string)
+
+let invite_use rpc feed =
+  let body = Ssb_j.string_of_invite_use {
+    name = ["invite";"use"];
+    type_="async";
+    args = [{feed = show_feed_id feed}]
+  }
+  in
+  RPC.async rpc body
 
 let chop_suffix s suffix =
   if not (String.ends_with s suffix) then fail "no suffix %S" suffix;
@@ -501,6 +526,26 @@ let execute_server ~network_key sockaddr identity =
   let%lwt _server = Lwt_io.establish_server_with_client_address sockaddr handler in
   wait_forever ()
 
+let parse_invite s =
+  try
+    Scanf.sscanf s "%s@:%d:@%s@=.%s@~%s@=%!" begin fun host port pk pubkey_type seed ->
+      match pubkey_type with
+      | "ed25519" -> (Unix.(ADDR_INET (inet_addr_of_string host, port)), Sign.Bytes.to_public_key @@ debase64 pk, Sign.(seed_keypair @@ Bytes.to_seed @@ debase64 seed))
+      | s -> fail "key type %S not supported" s
+    end
+  with exn -> fail ~exn "failed to parse invite"
+
+let redeem_invite ~network_key invite identity =
+  let (addr,server_pk,invite_identity) = parse_invite invite in
+  Lwt_io.with_connection addr begin fun c ->
+    let%lwt box_stream = Handshake.client_handshake ~network_key ~server_pk c invite_identity in
+    let rpc = RPC.start box_stream begin fun _ _ -> eprintfn "some new req"; Lwt.return_unit end in
+    RPC.bracket rpc begin fun () ->
+      let%lwt _reply = invite_use rpc (snd identity) in
+      Lwt.return_unit
+    end
+  end
+
 let identity =
   let sk = Sign.Bytes.to_secret_key @@ debase64 "6TVTCwrOfzNgNK5FHTQsuKPet+f/xjQWg2Y1pVcBWhiHUBuJ3O8K5YLJst5Zcb5Hu3fSv2hl5A+WN4uX0Q6bFA" in
   let pk = Sign.Bytes.to_public_key @@ debase64 "h1AbidzvCuWCybLeWXG+R7t30r9oZeQPljeLl9EOmxQ" in
@@ -532,5 +577,6 @@ let () =
   | "main"::[] -> Lwt_main.run @@ test_main ()
   | "test"::[] -> Lwt_main.run @@ test_test ()
   | "server"::[] -> Lwt_main.run @@ execute_server ~network_key:my_testnet Unix.(ADDR_INET (inet_addr_loopback, 8007)) server_identity
+  | "redeem"::invite::[] -> Lwt_main.run @@ redeem_invite ~network_key:my_testnet invite identity
   | "stringify"::[] -> print_endline @@ json_stringify @@ Yojson.Basic.from_string @@ Std.input_all stdin
   | _ -> fail "wut?"

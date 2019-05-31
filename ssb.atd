@@ -40,3 +40,7 @@ type createHistoryStream_args = {
 }
 
 type createHistoryStream = createHistoryStream_args rpc_call
+
+type invite_use_args = { feed : string }
+
+type invite_use = invite_use_args rpc_call
